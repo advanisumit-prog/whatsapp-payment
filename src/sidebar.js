@@ -1969,6 +1969,42 @@ class Sidebar {
         const sortedEntries = Array.from(imageMap.entries())
             .sort((a, b) => a[1].sortKey - b[1].sortKey);
 
+        // Phase 2 finishes scrolled down at the NEWEST end of the date window,
+        // but downloads start at the OLDEST message — the opposite end.
+        // Without this, the first download has to discover that gap on its
+        // own (one unguided jump backward) before the per-message "scroll
+        // down as we go" recovery even applies. Do the jump deliberately,
+        // once, here — order stays oldest-to-newest (hash/dedup and the
+        // report both depend on that), and every download after this point
+        // only ever has to scroll down.
+        if (sortedEntries.length > 0) {
+
+            console.log("  🔼 Re-syncing scroll position to the oldest message before downloading...");
+
+            const resyncBox = await container.boundingBox().catch(() => null);
+
+            if (resyncBox) {
+
+                await page.mouse.move(resyncBox.x + resyncBox.width / 2, resyncBox.y + resyncBox.height / 2);
+
+                let stableTop = 0;
+
+                for (let i = 0; i < 60 && stableTop < 2; i++) {
+
+                    const top = await container.evaluate(el => el.scrollTop).catch(() => null);
+
+                    if (top !== null && top <= 5) {
+                        stableTop++;
+                    } else {
+                        stableTop = 0;
+                    }
+
+                    await page.mouse.wheel(0, -800);
+                    await page.waitForTimeout(250);
+                }
+            }
+        }
+
         let totalSaved = 0;
         let previousSrc = null;
         const pendingDownloads = [];
