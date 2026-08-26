@@ -779,6 +779,17 @@ async function dismissDialogs(page) {
     return false;
 }
 
+/**
+ * Once Playwright reports the page/context/browser gone, every remaining
+ * locator call in this run will fail the same way. Without this check the
+ * watchlist loop burns through every still-to-process chat and image,
+ * retrying and logging a failure for each one, before finally reporting a
+ * misleading "done" summary.
+ */
+function isPageClosedError(err) {
+    return /Target page, context or browser has been closed/i.test(err && err.message || "");
+}
+
 class Sidebar {
     constructor(page) {
         this.page = page;
@@ -918,6 +929,10 @@ class Sidebar {
         const searchBox = this.page.locator('input[aria-label="Search or start a new chat"], input[data-tab="3"]').first();
 
         for (const watchEntry of watchList) {
+
+            if (this.page.isClosed()) {
+                throw new Error(`WhatsApp Web page/browser closed unexpectedly — aborting the rest of the watchlist (stopped before "${watchEntry.name}").`);
+            }
 
             const watchName = watchEntry.name;
             console.log(`Searching for: "${watchName}"`);
@@ -1076,6 +1091,9 @@ class Sidebar {
                     await this.page.waitForTimeout(3000);
 
                 } catch (err) {
+                    if (isPageClosedError(err)) {
+                        throw new Error(`WhatsApp Web page/browser closed unexpectedly while processing "${title}" — aborting the rest of the watchlist.`);
+                    }
                     console.log(`❌ Failed to process "${title}": ${err.message}`);
                 }
             }
@@ -1957,6 +1975,10 @@ class Sidebar {
 
         for (const [msgId, { mediaCount, messageTimestamp, partyLabel }] of sortedEntries) {
 
+            if (this.page.isClosed()) {
+                throw new Error(`WhatsApp Web page/browser closed unexpectedly — aborting remaining downloads in "${groupName}".`);
+            }
+
             for (let mediaIdx = 0; mediaIdx < mediaCount; mediaIdx++) {
 
                 const compositeId = `${msgId}_${mediaIdx}`;
@@ -1982,6 +2004,9 @@ class Sidebar {
                     }
                 } catch (err) {
                     console.log(`  ❌ Failed to download ${compositeId}: ${err.message}`);
+                    if (isPageClosedError(err)) {
+                        throw new Error(`WhatsApp Web page/browser closed unexpectedly while downloading ${compositeId} — aborting remaining downloads in "${groupName}".`);
+                    }
                 }
             }
         }
