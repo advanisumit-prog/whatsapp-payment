@@ -93,6 +93,33 @@ class Downloader {
         return closed;
     }
 
+    /**
+     * scrollIntoViewIfNeeded only acts on an element that already exists in
+     * the DOM. WhatsApp virtualizes the message list, so a row far from the
+     * current scroll position isn't there to find — no amount of re-waiting
+     * on the same locator mounts it. This nudges the conversation panel's
+     * own scroll position instead, the same technique the collection phase
+     * uses, so WhatsApp renders the rows in between.
+     *
+     * Messages are downloaded oldest-to-newest, so the next unrendered row
+     * is almost always further down; scroll down a little at a time rather
+     * than jumping, so we don't blow past it into a later part of the chat.
+     */
+    async nudgeTowardMessage() {
+
+        const container = this.page.locator('[data-testid="conversation-panel-messages"]');
+        const box = await container.boundingBox().catch(() => null);
+
+        if (!box) return;
+
+        await this.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+
+        for (let w = 0; w < 3; w++) {
+            await this.page.mouse.wheel(0, 500);
+            await this.page.waitForTimeout(250);
+        }
+    }
+
     async download(groupName, image, index, previousSrc = null, messageId = null, mediaIndex = 0) {
 
         const folder = path.join("downloads", sanitizePathSegment(groupName));
@@ -118,12 +145,22 @@ class Downloader {
         // The row may have been virtualized out of the DOM between collection
         // and download — the message is real, it just is not rendered right now.
         // Scroll it back and re-query rather than abandoning the payment.
-        for (let retry = 1; retry <= 3 && providers.length === 0 && thumbs.length === 0; retry++) {
+        for (let retry = 1; retry <= 6 && providers.length === 0 && thumbs.length === 0; retry++) {
 
             console.log(`  🔄 No media rendered — scrolling the message back into view (attempt ${retry})...`);
 
-            await image.locator.scrollIntoViewIfNeeded({ timeout: 8000 }).catch(() => {});
-            await this.page.waitForTimeout(1500 * retry);
+            const attached = await image.locator.scrollIntoViewIfNeeded({ timeout: 4000 })
+                .then(() => true)
+                .catch(() => false);
+
+            if (!attached) {
+                // scrollIntoViewIfNeeded had nothing to act on — the row isn't
+                // mounted at all. Nudge the panel's real scroll position so
+                // WhatsApp renders the rows between here and there.
+                await this.nudgeTowardMessage();
+            }
+
+            await this.page.waitForTimeout(1000 + 500 * retry);
 
             providers = await image.locator.locator('[data-testid="media-url-provider"]').all();
             thumbs = await image.locator.locator('[data-testid="image-thumb"]').all();
