@@ -1028,6 +1028,15 @@ class Sidebar {
                 continue;
             }
 
+            const contextAlive = await this.page.evaluate(() => true)
+                .then(() => true)
+                .catch(() => false);
+
+            if (!contextAlive) {
+                console.log("❌ The browser has closed — stopping the run.");
+                break;
+            }
+
             for (const title of matchedTitles) {
 
                 if (processedNames.has(title)) {
@@ -1535,6 +1544,16 @@ class Sidebar {
                     continue;
                 }
 
+                // A deleted message ("This message was deleted") keeps its row
+                // and sometimes a timestamp, but has no media to collect. Left in
+                // place it produces undated rows, phantom timestamps, and endless
+                // nudging of an image that will never load.
+                const wasDeleted = await row.evaluate(el =>
+                    !!el.querySelector('[data-icon="recalled"], [data-testid="recalled"]')
+                ).catch(() => false);
+
+                if (wasDeleted) continue;
+
                 const hasMsgContainer = await row.locator('[data-testid="msg-container"]').count();
                 if (hasMsgContainer === 0) continue;
 
@@ -1948,14 +1967,65 @@ class Sidebar {
             }
         }
 
+        // Download oldest first. WhatsApp recycles rows as you scroll, so the
+        // messages collected EARLIEST are the ones most likely to have been
+        // discarded from the DOM by the time downloading starts — taking them
+        // first means fewer are lost.
+        //
+        // A capped batch would be better still (download while each row is
+        // still rendered), but that is a larger change; anything missed here is
+        // simply picked up on the next run.
         const sortedEntries = Array.from(imageMap.entries())
             .sort((a, b) => a[1].sortKey - b[1].sortKey);
 
+        // Phase 2 finishes scrolled to the NEWEST end of the window, but
+        // downloads start at the OLDEST message — the opposite end. Without
+        // this the first download has to discover that gap itself, and every
+        // subsequent one is chasing rows that have already been recycled.
+        //
+        // Do the jump once, deliberately, here. Order stays oldest-to-newest
+        // (the hash dedupe and the report both depend on it), and from this
+        // point every download only ever needs to scroll DOWN.
+        if (sortedEntries.length > 0) {
+
+            console.log("  🔼 Re-syncing scroll position to the oldest message before downloading...");
+
+            const resyncBox = await container.boundingBox().catch(() => null);
+
+            if (resyncBox) {
+
+                await page.mouse.move(
+                    resyncBox.x + resyncBox.width / 2,
+                    resyncBox.y + resyncBox.height / 2
+                );
+
+                let stableTop = 0;
+
+                for (let i = 0; i < 60 && stableTop < 2; i++) {
+
+                    const top = await container.evaluate(el => el.scrollTop).catch(() => null);
+
+                    if (top !== null && top <= 5) {
+                        stableTop++;
+                    } else {
+                        stableTop = 0;
+                    }
+
+                    await page.mouse.wheel(0, -800);
+                    await page.waitForTimeout(250);
+                }
+            }
+        }
+
         let totalSaved = 0;
         let previousSrc = null;
+        let abandonQueue = false;
+        let missedInARow = 0;
         const pendingDownloads = [];
 
         for (const [msgId, { mediaCount, messageTimestamp, partyLabel }] of sortedEntries) {
+
+             if (abandonQueue) break;
 
             for (let mediaIdx = 0; mediaIdx < mediaCount; mediaIdx++) {
 
@@ -1970,8 +2040,32 @@ class Sidebar {
                 const freshMsg = page.locator(`[data-id="${msgId}"]`).first();
                 const imageObj = { locator: freshMsg };
 
+                // Once the browser has gone there is nothing left to download,
+                // and every remaining image would fail the same way — dozens of
+                // identical errors spinning for as long as the queue lasts.
+                const browserGone = await page.evaluate(() => true)
+                    .then(() => false)
+                    .catch(err => /closed|Target page/i.test(err.message));
+
+                if (browserGone) {
+                    console.log("  ❌ The browser has closed — abandoning the rest of this group.");
+                    break;
+                }
+
                 try {
                     const result = await downloader.download(groupName, imageObj, totalSaved, previousSrc, msgId, mediaIdx);
+
+                    if (!result) {
+                        // Too many gone from the DOM means the rest of the queue
+                        // has been recycled too — carrying on just burns time.
+                        if (++missedInARow >= 15) {
+                            console.log(`  ⏭ ${missedInARow} messages in a row are no longer rendered — stopping here; the rest will be picked up next run.`);
+                            abandonQueue = true;  
+                            break;
+                        }
+                    } else {
+                        missedInARow = 0;
+                    }
 
                     if (result) {
                         console.log(`  ✓ Saved: ${result.fileName} (${compositeId})`);
