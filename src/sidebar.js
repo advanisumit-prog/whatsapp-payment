@@ -6,7 +6,6 @@ const readPaymentsBatch = require("../readPaymentsBatch");
 const phash = require("sharp-phash");
 const phashDistance = require("sharp-phash/distance");
 
-
 // ---------------------------------------------------------------------------
 // Tunable waits. Override in config/settings.js if you want per-environment
 // values. These are MAX waits, not fixed sleeps — the script continues as soon
@@ -34,7 +33,6 @@ const DATE_IS_DAY_FIRST = settings.dateIsDayFirst !== undefined ? settings.dateI
 // A single mis-dated message cannot trigger it: a date divider is definitive,
 // and the image check needs two today-dated images in a row.
 const STOP_AT_TODAY = settings.stopAtToday !== false;
-
 
 function parseDividerDate(text) {
     const trimmed = text.trim();
@@ -127,6 +125,29 @@ function parsePrePlainText(pre) {
     };
 }
 
+/**
+ * Builds a selector for re-finding a row by its captured data-id.
+ *
+ * A normal message's data-id is stable, so an exact match is fine. An
+ * album's data-id is NOT stable — its format is "album-<first>-<last>-<n>",
+ * and WhatsApp rewrites the <last> segment (and sometimes <n>) as more
+ * thumbnails lazy-load after the id was first captured. An exact match on
+ * a stale album id then matches nothing, forever, even though the album is
+ * fully rendered and on-screen — which looks identical to "not rendered"
+ * and defeats every nudge/retry/scroll-back attempt downstream.
+ *
+ * <first> is the id of the album's first photo and does not change, so for
+ * album ids we match on that stable prefix instead of the full string.
+ */
+function rowSelectorForId(msgId) {
+    const id = String(msgId || "");
+    const albumMatch = id.match(/^album-([^-]+)-/);
+    if (albumMatch) {
+        return `[data-id^="album-${albumMatch[1]}-"]`;
+    }
+    return `[data-id="${id}"]`;
+}
+
 const MAX_LABEL_LENGTH = settings.maxLabelLength || 60;
 
 /**
@@ -163,9 +184,6 @@ function isPlausibleLabel(text) {
  */
 async function readFollowingLabel(row) {
 
-    // Same reasoning as readNearestDividerDate: an in-page walk instead of a
-    // following:: axis. Steps forward past any further image rows, so a batch
-    // of images all resolve to the one label posted beneath them.
     const text = await row.evaluate(el => {
 
         let node = el;
@@ -199,6 +217,48 @@ async function readFollowingLabel(row) {
 
     if (!isPlausibleLabel(text)) {
         console.log(`  🚫 Following text rejected as label: "${text.trim().slice(0, 40).replace(/\n/g, " ")}..."`);
+        return null;
+    }
+
+    return text.trim();
+}
+
+// New: search backwards for a plausible one-line text label (symmetric to readFollowingLabel)
+async function readPreviousLabel(row) {
+
+    const text = await row.evaluate(el => {
+
+        let node = el;
+        let hops = 0;
+
+        while (node && hops < 5) {
+
+            let prev = node.previousElementSibling;
+
+            while (prev) {
+                const hasMedia = prev.querySelector('[data-testid="media-url-provider"]');
+                const textNode = prev.querySelector('[data-testid="selectable-text"] > span');
+
+                if (!hasMedia && textNode && textNode.innerText && textNode.innerText.trim()) {
+                    return textNode.innerText;
+                }
+                prev = prev.previousElementSibling;
+            }
+
+            node = node.parentElement;
+            hops++;
+
+            if (node && node.getAttribute("data-testid") === "conversation-panel-messages") break;
+        }
+
+        return null;
+
+    }).catch(() => null);
+
+    if (!text) return null;
+
+    if (!isPlausibleLabel(text)) {
+        console.log(`  🚫 Previous text rejected as label: "${text.trim().slice(0, 40).replace(/\n/g, " ")}..."`);
         return null;
     }
 
@@ -403,6 +463,67 @@ function timeTextToMinutes(text) {
     return h * 60 + mm;
 }
 
+
+/**
+ * Closes WhatsApp's promo and update dialogs.
+ *
+ * They sit over the message area, so clicks land on the overlay instead of the
+ * chat and everything downstream silently fails. Only dismissal buttons are
+ * clicked — never a call to action like "Try it now", which would navigate
+ * away.
+ */
+async function safeDismissDialogs(page) {
+
+    try {
+
+        const dismissed = await page.evaluate(() => {
+
+            const labels = /^(continue|got it|ok|okay|dismiss|not now|later|close|skip|no thanks)$/i;
+
+            const dialogs = Array.from(
+                document.querySelectorAll('[role="dialog"], [data-animate-modal-body="true"]')
+            ).filter(d => d.offsetWidth > 0 || d.offsetHeight > 0);
+
+            for (const dialog of dialogs) {
+
+                const heading = (dialog.innerText || "").split("\n")[0].slice(0, 50);
+
+                const match = Array.from(dialog.querySelectorAll('button, [role="button"]'))
+                    .find(b => labels.test((b.innerText || "").trim()));
+
+                if (match) { match.click(); return heading; }
+
+                const closer = dialog.querySelector(
+                    '[data-icon="x"], [aria-label="Close"], [data-testid="btn-closer"]'
+                );
+
+                if (closer) { (closer.closest("button") || closer).click(); return heading; }
+            }
+
+            // Some promos render outside a dialog role — fall back to a bare Close.
+            const loose = Array.from(document.querySelectorAll('button[aria-label="Close"]'))
+                .find(b => b.offsetWidth || b.offsetHeight);
+
+            if (loose) { loose.click(); return "(banner)"; }
+
+            return null;
+
+        }).catch(() => null);
+
+        if (dismissed) {
+            console.log(`  🪟 Closed WhatsApp dialog: "${dismissed}"`);
+            await page.waitForTimeout(1200);
+            return true;
+        }
+
+        return false;
+
+    } catch (e) {
+        console.log("  ⚠️ safeDismissDialogs failed:", e && e.message ? e.message : e);
+        return false;
+    }
+}
+
 async function validateTimestamp(row, sortKey, timeText) {
 
     if (!sortKey) return null;
@@ -414,11 +535,24 @@ async function validateTimestamp(row, sortKey, timeText) {
     const SLACK_MS = 60 * 1000;
 
     if (before && sortKey < before.timestamp.getTime() - SLACK_MS) {
-        return `earlier than the message above it (${before.timestamp.toLocaleString()})`;
+
+        // The message above carries its own data-pre-plain-text, so its date is
+        // authoritative — better evidence than the divider date this row
+        // inherited. Rather than refuse the row, hand back the correct DAY so
+        // the caller can re-date it: messages are chronological, so a row below
+        // a 24 August message belongs to the 24th (or later), never the 23rd.
+        return {
+            problem: `earlier than the message above it (${before.timestamp.toLocaleString()})`,
+            correctedDate: new Date(
+                before.timestamp.getFullYear(),
+                before.timestamp.getMonth(),
+                before.timestamp.getDate()
+            )
+        };
     }
 
     if (after && sortKey > after.timestamp.getTime() + SLACK_MS) {
-        return `later than the message below it (${after.timestamp.toLocaleString()})`;
+        return { problem: `later than the message below it (${after.timestamp.toLocaleString()})` };
     }
 
     // Bubble-clock check: works for uncaptioned images, which have no
@@ -431,9 +565,11 @@ async function validateTimestamp(row, sortKey, timeText) {
 
         if (preceding && preceding.minutes !== undefined && preceding.minutes !== null) {
             if (mine < preceding.minutes - 1) {
-                return `out of order: ${timeText} sits below a message at ` +
-                       `${String(Math.floor(preceding.minutes / 60)).padStart(2, "0")}:` +
-                       `${String(preceding.minutes % 60).padStart(2, "0")} with no date divider between them`;
+                return {
+                    problem: `out of order: ${timeText} sits below a message at ` +
+                             `${String(Math.floor(preceding.minutes / 60)).padStart(2, "0")}:` +
+                             `${String(preceding.minutes % 60).padStart(2, "0")} with no date divider between them`
+                };
             }
         }
     }
@@ -617,7 +753,7 @@ function parseSinceDate(value) {
 }
 
 /**
- * WhatsApp shows "Click here to get older messages from your phone." once the
+ * WhatsApp Web shows "Click here to get older messages from your phone." once the
  * browser's local history runs out. Waiting does nothing — it loads only on
  * click. Returns true if it clicked, so the caller can keep scrolling instead
  * of concluding it has reached the top of the chat.
@@ -733,52 +869,6 @@ async function resolveCutoffDate(database, groupName) {
     return configured;
 }
 
-/**
- * WhatsApp Web shows "What's new" and similar dialogs after an update. They sit
- * over everything, so scrolling and clicking silently do nothing until they are
- * closed — which on an unattended run looks like the scraper simply losing
- * messages. Called before and during collection so a dialog that appears
- * mid-run does not strand it.
- */
-async function dismissDialogs(page) {
-
-    const dismissed = await page.evaluate(() => {
-
-        const labels = /^(continue|got it|ok|okay|dismiss|not now|later|close|skip)$/i;
-
-        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-body="true"]'))
-            .filter(d => d.offsetWidth > 0 || d.offsetHeight > 0);
-
-        if (dialogs.length === 0) return null;
-
-        for (const dialog of dialogs) {
-
-            const heading = (dialog.innerText || "").split("\n")[0].slice(0, 60);
-
-            // Prefer a real button with a known label.
-            const buttons = Array.from(dialog.querySelectorAll('button, [role="button"]'));
-
-            const match = buttons.find(b => labels.test((b.innerText || "").trim()));
-            if (match) { match.click(); return heading; }
-
-            // Otherwise the close X.
-            const closer = dialog.querySelector('[data-icon="x"], [aria-label="Close"], [data-testid="btn-closer"]');
-            if (closer) { closer.click(); return heading; }
-        }
-
-        return null;
-
-    }).catch(() => null);
-
-    if (dismissed) {
-        console.log(`  🪟 Closed WhatsApp dialog: "${dismissed}"`);
-        await page.waitForTimeout(1500);
-        return true;
-    }
-
-    return false;
-}
-
 class Sidebar {
     constructor(page) {
         this.page = page;
@@ -851,7 +941,7 @@ class Sidebar {
                     if (stablePolls >= 3) {
                         console.log(`✅ WhatsApp Web ready — ${rowCount} chat(s) in sidebar. Settling ${POST_READY_SETTLE / 1000}s...`);
                         await this.page.waitForTimeout(POST_READY_SETTLE);
-                        await dismissDialogs(this.page);
+                        await safeDismissDialogs(this.page);
                         return true;
                     }
                 } else {
@@ -923,7 +1013,7 @@ class Sidebar {
             console.log(`Searching for: "${watchName}"`);
 
             // An update dialog can appear at any point and blocks every click.
-            await dismissDialogs(this.page);
+            await safeDismissDialogs(this.page);
 
             let matchedTitles = [];
             let searchSucceeded = false;
@@ -1202,7 +1292,7 @@ class Sidebar {
         console.log("  Waiting extra time for newest messages to fully render...");
         await page.waitForTimeout(3000);
 
-        await dismissDialogs(page);
+        await safeDismissDialogs(page);
 
         const cutoffDate = await resolveCutoffDate(database, groupName);
 
@@ -1361,10 +1451,45 @@ class Sidebar {
         console.log("  --- Phase 2: scrolling down, collecting images ---");
 
         const imageMap = new Map();
+
+        // Maps an album's stable first-photo hash -> the msgId of the fullest
+        // detection seen so far for it. Lets the dedupe above tell "same album,
+        // grown since last time" apart from "different album".
+        const albumFirstHashSeen = new Map();
+
+        // Where each message sits in the conversation, captured as it is found.
+        // Used later to jump straight back to a row that has been virtualized
+        // away, instead of hunting for a locator that cannot resolve.
+        const imageScrollPositions = new Map();
+
+        const recordScrollPosition = async id => {
+
+            if (imageScrollPositions.has(id)) return;
+
+            const y = await page.evaluate(msgId => {
+
+                const el = document.querySelector(`[data-id="${msgId}"]`);
+                if (!el) return null;
+
+                const panel = el.closest('[data-testid="conversation-panel-messages"]');
+                if (!panel) return null;
+
+                // Target scrollTop that puts this row ~200px below the top.
+                const offset = el.getBoundingClientRect().top - panel.getBoundingClientRect().top;
+                return Math.max(0, panel.scrollTop + offset - 200);
+
+            }, id).catch(() => null);
+
+            if (y !== null) imageScrollPositions.set(id, y);
+        };
         let currentDividerDate = null;
         let previousBottomCount2 = 0;
         let stableBottomCount2 = 0;
         let unknownDateSkips = 0;
+
+        // Messages refused by the ordering check. Kept so the same rows are not
+        // re-evaluated (and re-logged) on every subsequent scroll pass.
+        const refusedRows = new Set();
         let nudged = new Set();
         let barrenPasses = 0;
         let lastImageCount = 0;
@@ -1379,10 +1504,17 @@ class Sidebar {
 
         for (let i = 0; i < maxScrollsDown; i++) {
 
-            // Each pass rescans the rendered window from the top. A date carried
-            // over from the previous pass would be applied to rows that sit ABOVE
-            // the divider it came from, so the context must start empty.
-            currentDividerDate = null;
+            // Carry the date ACROSS passes rather than resetting it.
+            //
+            // Phase 2 scrolls strictly downward, so time only moves forward: a
+            // message seen after a "24 August" divider cannot belong to the
+            // 23rd. Resetting each pass threw that away, and since most messages
+            // here carry no data-pre-plain-text, they then fell back to whatever
+            // stale divider the rendered window happened to contain — which is
+            // how a 24 August message ended up filed under the 23rd.
+            //
+            // The divider itself is only ever allowed to move the date FORWARD
+            // (see below), so a stale render cannot drag it backwards.
             pendingLabelQueue.length = 0;
 
             // One read of the whole rendered conversation, top to bottom. Far
@@ -1402,6 +1534,41 @@ class Sidebar {
                     continue;
                 }
 
+                // Rows are rescanned on EVERY pass, so a message already
+                // collected — or already refused — would otherwise be fully
+                // re-evaluated 70+ times: several page.evaluate round trips
+                // each, plus two DOM walks in the ordering check. One cheap
+                // id read up front skips all of that.
+                if (role === "row") {
+
+                    const seenId = await item.evaluate(el => {
+                        const holder = el.querySelector("[data-id]") || el.closest("[data-id]");
+                        return holder ? holder.getAttribute("data-id") : null;
+                    }).catch(() => null);
+
+                    if (seenId) {
+
+                        if (refusedRows.has(seenId)) continue;
+
+                        // Already collected: the only thing still worth doing is
+                        // filling in a label that was not resolvable earlier.
+                        if (imageMap.has(seenId)) {
+
+                            const existing = imageMap.get(seenId);
+
+                            if (trackPartyLabels && !existing.partyLabel) {
+                                const retryLabel = await readFollowingLabel(item).catch(() => null);
+                                if (retryLabel) {
+                                    existing.partyLabel = retryLabel;
+                                    console.log(`  🏷️ Resolved label "${retryLabel}" for ${seenId}`);
+                                }
+                            }
+
+                            continue;
+                        }
+                    }
+                }
+
                 if (role !== 'row') {
                     const dividerText = await item
                         .locator('span[dir="auto"]')
@@ -1412,7 +1579,14 @@ class Sidebar {
                     if (dividerText) {
                         const parsedDate = parseDividerDate(dividerText);
                         if (parsedDate) {
-                            currentDividerDate = parsedDate;
+                            // Only ever move forward. A divider older than the
+                            // date already established is a stale render from
+                            // higher up the conversation, not a real move back.
+                            if (!currentDividerDate || parsedDate >= currentDividerDate) {
+                                currentDividerDate = parsedDate;
+                            } else {
+                                console.log(`  ↩️ Ignoring an older divider ("${dividerText}") — already past that point.`);
+                            }
                             console.log(`  📅 Date context: "${dividerText}" → ${parsedDate.toDateString()}`);
 
                             // Messages are chronological: everything below a
@@ -1455,6 +1629,26 @@ class Sidebar {
                     }
 
                     const mediaCount = Math.max(albumProviders, albumThumbs, declaredCount);
+
+                    // Dedupe by the STABLE part of the album id (the first
+                    // photo's hash), not the full msgId. The full msgId's tail
+                    // segment mutates as more thumbnails lazy-load, so the same
+                    // physical album can be "found" more than once with a
+                    // different msgId each time (see rowSelectorForId above) —
+                    // an exact-string dedupe check misses that and queues the
+                    // same album for download twice. A later, fuller detection
+                    // (higher declared count) supersedes an earlier partial one.
+                    const albumFirstHash = msgId.match(/^album-([^-]+)-/)?.[1];
+
+                    if (albumFirstHash) {
+                        const priorMsgId = albumFirstHashSeen.get(albumFirstHash);
+                        if (priorMsgId) {
+                            const priorCount = imageMap.get(priorMsgId)?.mediaCount || 0;
+                            if (mediaCount <= priorCount) continue;   // earlier detection is >= this one — keep it
+                            imageMap.delete(priorMsgId);              // this detection is fuller — supersede it
+                        }
+                        albumFirstHashSeen.set(albumFirstHash, msgId);
+                    }
 
                     if (!msgId || mediaCount === 0 || imageMap.has(msgId)) continue;
 
@@ -1517,15 +1711,36 @@ class Sidebar {
                         }
                     }
 
-                    const messageTimestamp = formatTimestamp(effectiveDate, timeText);
+                    let messageTimestamp = formatTimestamp(effectiveDate, timeText);
 
                     // Reject a date that contradicts the surrounding messages:
                     // chronological order makes a day-early resolution detectable.
-                    const problem = await validateTimestamp(row, sortKey, timeText);
+                    const check = await validateTimestamp(row, sortKey, timeText);
 
-                    if (problem) {
+                    if (check && check.correctedDate) {
+
+                        // The message above carries its own timestamp, so use its
+                        // DAY and keep this row's own clock time. This happens
+                        // when the divider for the newer day scrolled out of view
+                        // and the row inherited the previous day's date.
+                        const fixed = new Date(check.correctedDate);
+                        const hm = String(timeText || "").match(/(\d{1,2}):(\d{2})/);
+
+                        if (hm) fixed.setHours(+hm[1], +hm[2], 0, 0);
+
+                        console.log(`  📅 Re-dated ALBUM ${msgId}: ${messageTimestamp} → ${formatTimestamp(fixed, timeText)} (from the message above).`);
+
+                        effectiveDate = new Date(fixed.getFullYear(), fixed.getMonth(), fixed.getDate());
+                        sortKey = fixed.getTime();
+                        messageTimestamp = formatTimestamp(effectiveDate, timeText);
+
+                        if (effectiveDate < cutoffDate) continue;
+                        if (effectiveDate >= endDateExclusive) continue;
+
+                    } else if (check) {
                         unknownDateSkips++;
-                        console.log(`  🚩 Skipping ALBUM ${msgId}: resolved ${messageTimestamp} is ${problem}.`);
+                        refusedRows.add(msgId);
+                        console.log(`  🚩 Skipping ALBUM ${msgId}: resolved ${messageTimestamp} is ${check.problem}.`);
                         continue;
                     }
 
@@ -1534,6 +1749,14 @@ class Sidebar {
                         : staticPartyLabel;
 
                     imageMap.set(msgId, { mediaCount, sortKey, messageTimestamp, partyLabel: albumLabel });
+
+                    // Record where this message sits in the conversation NOW,
+                    // while its row is still rendered. Doing it later is too
+                    // late: by the time downloading starts, the oldest rows —
+                    // exactly the ones needed first — have been recycled and
+                    // querySelector returns nothing for them.
+                    await recordScrollPosition(msgId);
+
 
                     if (trackPartyLabels && !albumLabel) {
                         pendingLabelQueue.push(msgId);
@@ -1734,7 +1957,7 @@ class Sidebar {
                             console.log(`  🏷️ Resolved label "${retryLabel}" for ${msgId}`);
                         }
                     }
-                    continue;
+                 continue;
                 }
 
                 // Prefer the message's own timestamp; fall back to the nearest
@@ -1796,15 +2019,36 @@ class Sidebar {
                     }
                 }
 
-                const messageTimestamp = formatTimestamp(effectiveDate, timeText);
+                let messageTimestamp = formatTimestamp(effectiveDate, timeText);
 
                 // Reject a date that contradicts the surrounding messages:
                 // chronological order makes a day-early resolution detectable.
-                const problem = await validateTimestamp(row, sortKey, timeText);
+                const check = await validateTimestamp(row, sortKey, timeText);
 
-                if (problem) {
+                if (check && check.correctedDate) {
+
+                    // The message above carries its own timestamp, so use its DAY
+                    // and keep this row's own clock time. This happens when the
+                    // divider for the newer day scrolled out of view and the row
+                    // inherited the previous day's date.
+                    const fixed = new Date(check.correctedDate);
+                    const hm = String(timeText || "").match(/(\d{1,2}):(\d{2})/);
+
+                    if (hm) fixed.setHours(+hm[1], +hm[2], 0, 0);
+
+                    console.log(`  📅 Re-dated ${msgId}: ${messageTimestamp} → ${formatTimestamp(fixed, timeText)} (from the message above).`);
+
+                    effectiveDate = new Date(fixed.getFullYear(), fixed.getMonth(), fixed.getDate());
+                    sortKey = fixed.getTime();
+                    messageTimestamp = formatTimestamp(effectiveDate, timeText);
+
+                    if (effectiveDate < cutoffDate) continue;
+                    if (effectiveDate >= endDateExclusive) continue;
+
+                } else if (check) {
                     unknownDateSkips++;
-                    console.log(`  🚩 Skipping ${msgId}: resolved ${messageTimestamp} is ${problem}.`);
+                    refusedRows.add(msgId);
+                    console.log(`  🚩 Skipping ${msgId}: resolved ${messageTimestamp} is ${check.problem}.`);
                     continue;
                 }
 
@@ -1816,6 +2060,14 @@ class Sidebar {
                     : staticPartyLabel;
 
                 imageMap.set(msgId, { mediaCount, sortKey, messageTimestamp, partyLabel: initialPartyLabel });
+
+                // Record where this message sits in the conversation NOW,
+                // while its row is still rendered. Doing it later is too
+                // late: by the time downloading starts, the oldest rows —
+                // exactly the ones needed first — have been recycled and
+                // querySelector returns nothing for them.
+                await recordScrollPosition(msgId);
+
 
                 console.log(`  📸 Found image message (${msgId}) @ ${messageTimestamp}${initialPartyLabel ? ` → "${initialPartyLabel}"` : " → label pending"}`);
 
@@ -1930,39 +2182,111 @@ class Sidebar {
         console.log(`  Found ${imageMap.size} image message(s) total in "${groupName}"`);
 
         if (unknownDateSkips > 0) {
-            console.log(`  ℹ️ ${unknownDateSkips} row-scan(s) skipped because no date could be determined. If this number is large and images are missing, data-pre-plain-text may be absent in this chat.`);
+            console.log(`  ℹ️ ${unknownDateSkips} row-scan(s) skipped because no date could be determined. If this number is large and images are missing, data-pre-plain-text may be absent in this WhatsApp Web version.`);
         }
 
-        // Final label pass: anything still unresolved gets one more try now
-        // that scrolling has stopped and the DOM has settled. Without this, an
-        // image whose label message rendered late keeps a NULL party_label
-        // forever, because the row is never revisited.
+        // Forward-fill labels across a run of images.
+        //
+        // The usual pattern here is several payment screenshots posted in a row
+        // and then ONE name typed underneath, which belongs to all of them. The
+        // DOM walk only reaches the label from the image directly above it —
+        // anything further up (or separated by an album) comes back empty.
+        //
+        // Working on the collected list instead, in chronological order, an
+        // unlabelled image simply takes the label of the next labelled image
+        // after it, provided they are close together in time.
+        if (trackPartyLabels) {
+
+            const chronological = Array.from(imageMap.entries())
+                .sort((a, b) => a[1].sortKey - b[1].sortKey);
+
+            const MAX_GAP_MS = 30 * 60 * 1000;   // half an hour
+
+            let filled = 0;
+
+            for (let i = 0; i < chronological.length; i++) {
+
+                const [, entry] = chronological[i];
+                if (entry.partyLabel) continue;
+
+                // Look ahead for the next image that does have a label.
+                for (let j = i + 1; j < chronological.length; j++) {
+
+                    const [, later] = chronological[j];
+                    if (!later.partyLabel) continue;
+
+                    const gap = (later.sortKey || 0) - (entry.sortKey || 0);
+
+                    if (gap >= 0 && gap <= MAX_GAP_MS) {
+                        entry.partyLabel = later.partyLabel;
+                        filled++;
+                    }
+
+                    break;   // only ever the NEXT labelled image
+                }
+            }
+
+            if (filled > 0) {
+                console.log(`  🏷️ Carried a following label onto ${filled} earlier image(s) in the same run.`);
+            }
+        }
+
+        // Final label pass — for rows that HAPPEN to still be on screen.
+        //
+        // Deliberately cheap: no scrolling back to find a row, no retry loops.
+        // Hunting a label up and down the conversation cost minutes per image
+        // and rarely found anything the forward-fill above had not already
+        // resolved. A missing label is stored as NULL, which is honest and can
+        // be filled in by hand.
         if (trackPartyLabels) {
 
             const unlabelled = Array.from(imageMap.entries()).filter(([, v]) => !v.partyLabel);
 
             if (unlabelled.length > 0) {
-                console.log(`  🔁 Final label pass for ${unlabelled.length} image(s) with no label yet...`);
+                console.log(`  🔁 Final label pass for ${unlabelled.length} image(s) with no label yet (on-screen rows only)...`);
 
                 for (const [msgId, entry] of unlabelled) {
 
-                    const freshRow = page.locator(`[data-id="${msgId}"]`).first();
+                    const freshRow = page.locator(rowSelectorForId(msgId)).first();
 
+                    // Only bother if the row is already rendered.
                     const visible = await freshRow.isVisible().catch(() => false);
 
                     if (!visible) {
-                        await freshRow.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-                        await page.waitForTimeout(400);
+                        console.log(`  ⏭ ${msgId} is not on screen — leaving its label NULL.`);
+                        continue;
                     }
 
-                    const label = await readFollowingLabel(freshRow).catch(() => null);
+                    // One attempt at each strategy — no retries, no waiting.
+                    let label = await readFollowingLabel(freshRow).catch(() => null);
+
+                    if (!label) {
+                        label = await readPreviousLabel(freshRow).catch(() => null);
+                    }
+
+                    if (!label) {
+                        const caption = await freshRow
+                            .locator('[data-testid="selectable-text"] > span')
+                            .first()
+                            .innerText({ timeout: 500 })
+                            .catch(() => null);
+
+                        if (caption && isPlausibleLabel(caption)) label = caption;
+                    }
 
                     if (label) {
                         entry.partyLabel = label;
                         console.log(`  🏷️ Late-resolved label "${label}" for ${msgId}`);
-                    } else {
-                        console.log(`  ⚠️ Still no label for ${msgId} — will store NULL.`);
+                        continue;
                     }
+
+                    // Nothing found. A full-page screenshot per unlabelled image
+                    // cost seconds each and was never looked at — just note the id.
+                    try {
+                        fs.appendFileSync("unresolved_labels.txt", `${msgId}\n`);
+                    } catch (e) { /* ignore */ }
+
+                    console.log(`  ⚠️ No label for ${msgId} — storing NULL.`);
                 }
             }
         }
@@ -1978,43 +2302,66 @@ class Sidebar {
         const sortedEntries = Array.from(imageMap.entries())
             .sort((a, b) => a[1].sortKey - b[1].sortKey);
 
-        // Phase 2 finishes scrolled to the NEWEST end of the window, but
-        // downloads start at the OLDEST message — the opposite end. Without
-        // this the first download has to discover that gap itself, and every
-        // subsequent one is chasing rows that have already been recycled.
+        // Phase 2 finishes scrolled down at the NEWEST end of the date window,
+        // but downloads start at the OLDEST message — the opposite end.
         //
-        // Do the jump once, deliberately, here. Order stays oldest-to-newest
-        // (the hash dedupe and the report both depend on it), and from this
-        // point every download only ever needs to scroll DOWN.
+        // Scrolling to scrollTop<=5 (the top of loaded history) was the wrong
+        // target: Phase 1 stops at the cutoff DATE, not the true top of the
+        // chat, so there is usually more history above it and that scrollTop is
+        // never reached. Search for the actual first message instead and stop
+        // the moment it is found.
         if (sortedEntries.length > 0) {
+
+            const [firstMsgId] = sortedEntries[0];
+            const firstTarget = container.locator(rowSelectorForId(firstMsgId)).first();
 
             console.log("  🔼 Re-syncing scroll position to the oldest message before downloading...");
 
-            const resyncBox = await container.boundingBox().catch(() => null);
+            let found = await firstTarget.count().then(c => c > 0).catch(() => false);
 
-            if (resyncBox) {
+            // Fast path: jump straight to where this message sat when it was
+            // collected, rather than wheeling all the way back to it.
+            if (!found && imageScrollPositions.has(firstMsgId)) {
 
-                await page.mouse.move(
-                    resyncBox.x + resyncBox.width / 2,
-                    resyncBox.y + resyncBox.height / 2
-                );
+                await container.evaluate((el, y) => {
+                    try {
+                        el.scrollTop = y;
+                        el.dispatchEvent(new Event("scroll"));
+                    } catch (e) { /* panel gone */ }
+                }, imageScrollPositions.get(firstMsgId)).catch(() => {});
 
-                let stableTop = 0;
-
-                for (let i = 0; i < 60 && stableTop < 2; i++) {
-
-                    const top = await container.evaluate(el => el.scrollTop).catch(() => null);
-
-                    if (top !== null && top <= 5) {
-                        stableTop++;
-                    } else {
-                        stableTop = 0;
-                    }
-
-                    await page.mouse.wheel(0, -800);
+                for (let wait = 0; wait < 12 && !found; wait++) {
                     await page.waitForTimeout(250);
+                    found = await firstTarget.count().then(c => c > 0).catch(() => false);
                 }
             }
+
+            // Otherwise wheel up until the message itself appears.
+            if (!found) {
+
+                const resyncBox = await container.boundingBox().catch(() => null);
+
+                if (resyncBox) {
+
+                    await page.mouse.move(
+                        resyncBox.x + resyncBox.width / 2,
+                        resyncBox.y + resyncBox.height / 2
+                    );
+
+                    for (let i = 0; i < 120 && !found; i++) {
+
+                        found = await firstTarget.count().then(c => c > 0).catch(() => false);
+                        if (found) break;
+
+                        await page.mouse.wheel(0, -1000);
+                        await page.waitForTimeout(250);
+                    }
+                }
+            }
+
+            console.log(found
+                ? "  ✅ Oldest message located."
+                : "  ⚠️ Could not locate the oldest message during re-sync — falling back to per-message recovery.");
         }
 
         let totalSaved = 0;
@@ -2023,13 +2370,22 @@ class Sidebar {
         let missedInARow = 0;
         const pendingDownloads = [];
 
+        // Increased threshold to tolerate more virtualization churn before stopping.
+        const MISS_THRESHOLD = 25;
+
         for (const [msgId, { mediaCount, messageTimestamp, partyLabel }] of sortedEntries) {
 
              if (abandonQueue) break;
 
             for (let mediaIdx = 0; mediaIdx < mediaCount; mediaIdx++) {
 
-                const compositeId = `${msgId}_${mediaIdx}`;
+                // For albums, key by the stable first-photo hash rather than
+                // the full msgId — the tail segment can differ between runs
+                // (or even within one, see the dedupe above), which would
+                // otherwise make the "already downloaded" DB check miss a
+                // match and re-download images that were already saved.
+                const albumHash = msgId.match(/^album-([^-]+)-/)?.[1];
+                const compositeId = albumHash ? `album-${albumHash}_${mediaIdx}` : `${msgId}_${mediaIdx}`;
 
                 const alreadyDone = await database.existsByMessageId(compositeId);
                 if (alreadyDone) {
@@ -2037,7 +2393,7 @@ class Sidebar {
                     continue;
                 }
 
-                const freshMsg = page.locator(`[data-id="${msgId}"]`).first();
+                const freshMsg = page.locator(rowSelectorForId(msgId)).first();
                 const imageObj = { locator: freshMsg };
 
                 // Once the browser has gone there is nothing left to download,
@@ -2056,9 +2412,56 @@ class Sidebar {
                     const result = await downloader.download(groupName, imageObj, totalSaved, previousSrc, msgId, mediaIdx);
 
                     if (!result) {
-                        // Too many gone from the DOM means the rest of the queue
-                        // has been recycled too — carrying on just burns time.
-                        if (++missedInARow >= 15) {
+
+                        const msgElement = page.locator(rowSelectorForId(msgId)).first();
+                        let isVisible = await msgElement.isVisible().catch(() => false);
+
+                        if (!isVisible && imageScrollPositions.has(msgId)) {
+
+                            // Jump straight to where this message was when we
+                            // found it, then WAIT for WhatsApp to mount the row.
+                            // Re-querying immediately just fails again — the
+                            // render happens a moment after the scroll.
+                            const targetY = imageScrollPositions.get(msgId);
+
+                            await container.evaluate((el, y) => {
+                                try {
+                                    el.scrollTop = y;
+                                    el.dispatchEvent(new Event("scroll"));
+                                } catch (e) { /* panel gone */ }
+                            }, targetY).catch(() => {});
+
+                            for (let wait = 0; wait < 12 && !isVisible; wait++) {
+                                await page.waitForTimeout(250);
+                                isVisible = await msgElement.isVisible().catch(() => false);
+                            }
+
+                            if (isVisible) {
+                                console.log(`  ↩️ Jumped back to ${compositeId} and it rendered.`);
+                            }
+                        }
+
+                        if (!isVisible) {
+                            await msgElement.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+                            await page.waitForTimeout(800);
+                        }
+
+                        // Retry immediately
+                        try {
+                            const retryResult = await downloader.download(groupName, { locator: msgElement }, totalSaved, previousSrc, msgId, mediaIdx);
+                            if (retryResult) {
+                                console.log(`  ✓ Saved on retry: ${retryResult.fileName} (${compositeId})`);
+                                totalSaved++;
+                                previousSrc = retryResult.src;
+                                pendingDownloads.push({ compositeId, messageTimestamp, partyLabel, result: retryResult });
+                                missedInARow = 0;
+                                continue;
+                            }
+                        } catch (retryErr) {
+                            // Still failed; fall through to counting misses
+                        }
+
+                        if (++missedInARow >= MISS_THRESHOLD) {
                             console.log(`  ⏭ ${missedInARow} messages in a row are no longer rendered — stopping here; the rest will be picked up next run.`);
                             abandonQueue = true;  
                             break;
@@ -2223,8 +2626,7 @@ class Sidebar {
                     const messageDay = new Date(`${item.messageTimestamp.slice(0, 10)}T00:00:00`);
 
                     if (!isNaN(paymentDay) && !isNaN(messageDay) && paymentDay > messageDay) {
-                        console.log(`  🚩 Discarding ${item.result.fileName}: payment dated ${paymentDetails.date} but message dated ${item.messageTimestamp.slice(0, 10)} — the message date is wrong, so this row is not trustworthy.`);
-
+                        console.log(`  🚩 Discarding ${item.result.fileName}: payment dated ${paymentDetails.date} but message dated ${item.messageTimestamp.slice(0, 10)} — the message date appears to have been resolved earlier than the actual payment.`);
                         // Deliberately NOT marked as seen: once the date logic
                         // resolves it correctly, the next run should pick it up.
                         try { fs.unlinkSync(item.result.filePath); } catch (err) { /* already gone */ }
@@ -2250,7 +2652,7 @@ class Sidebar {
                         // to point back here.
                         foundInGroup = existingRecord.group_name;
 
-                        console.log(`  ♻️ Duplicate payment (UTR ${paymentDetails.utr}) — first recorded in "${existingRecord.group_name}". Adding a row for "${groupName}" that references it.`);
+                        console.log(`  ♻️ Duplicate payment (UTR ${paymentDetails.utr}) — first recorded in "${existingRecord.group_name}". Adding a row for "${groupName}" that references the original.`);
 
                         await database.markFoundInOtherGroupById(existingRecord.id, groupName);
                     }
