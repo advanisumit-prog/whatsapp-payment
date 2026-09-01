@@ -1004,6 +1004,7 @@ class Sidebar {
 
         const processedNames = new Set();
         let totalSaved = 0;
+        let isFirstChat = true; // only the very first chat opened this run risks a stale cached render
 
         const searchBox = this.page.locator('input[aria-label="Search or start a new chat"], input[data-tab="3"]').first();
 
@@ -1168,7 +1169,9 @@ class Sidebar {
                     await this.page.waitForTimeout(1500);
 
                     console.log(`  Processing images in "${title}"...`);
-                    const savedCount = await this.collectAndDownloadNewImages(this.page, database, downloader, title, watchEntry.label);
+                    const wasFirstChat = isFirstChat;
+                    isFirstChat = false;
+                    const savedCount = await this.collectAndDownloadNewImages(this.page, database, downloader, title, watchEntry.label, wasFirstChat);
                     console.log(`  Saved ${savedCount} new image(s) in "${title}"`);
                     totalSaved += savedCount;
 
@@ -1192,7 +1195,7 @@ class Sidebar {
         return totalSaved;
     }
 
-    async collectAndDownloadNewImages(page, database, downloader, groupName, staticPartyLabel = null) {
+    async collectAndDownloadNewImages(page, database, downloader, groupName, staticPartyLabel = null, isFirstChat = false) {
 
         const trackPartyLabels = staticPartyLabel === null; // no static label means use dynamic extraction
 
@@ -1213,12 +1216,25 @@ class Sidebar {
             }
         }
 
-        if (!messagesAppeared) {
+        // The FIRST chat opened after a fresh page load can paint a stale,
+        // cached snapshot of the conversation: msg-container elements are
+        // present — so the wait above is satisfied — but they belong to an
+        // old render that hasn't caught up with the live message store, so
+        // the newest messages are simply missing from the DOM. Every later
+        // chat this run is switching between panels that are already live,
+        // so only the very first one is at risk. Run the same reopen cure
+        // used below unconditionally that one time, even though messages
+        // technically "appeared".
+        const needsColdStartCure = !messagesAppeared || isFirstChat;
+
+        if (needsColdStartCure) {
 
             // Re-opening the chat forces WhatsApp to render it again. This is
-            // the usual cure when the FIRST group of a run finds nothing: the
-            // sidebar was ready, but the conversation panel had not caught up.
-            console.log("  🔄 No messages rendered — closing and re-opening the chat...");
+            // the usual cure when the FIRST group of a run finds nothing, or
+            // — as here — finds an old, un-synced render of it.
+            console.log(messagesAppeared
+                ? "  🔄 First chat of the run — re-opening it to guard against a stale cached render..."
+                : "  🔄 No messages rendered — closing and re-opening the chat...");
 
             await page.keyboard.press("Escape").catch(() => {});
             await page.waitForTimeout(2000);
