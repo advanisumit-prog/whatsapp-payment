@@ -1,5 +1,5 @@
 module.exports = [
-  // { name: "Moby & kamal vijaywada payment", label: "Kamal vijaywada" },
+  { name: "Moby & kamal vijaywada payment", label: "Kamal vijaywada" },
     { name: "Hr/Moby Payments", label: "Hr" },
      { name: "Tarun KT/Moby Payments", label: "TARUN KT" },
     {name:"Moby Lalit Hyderabad payment", label: "Lalit Hyderabad"},
